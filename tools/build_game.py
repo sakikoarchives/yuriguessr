@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a self-contained Artist Guessr index.html for GitHub Pages.
+"""Build a self-contained Yuri Guessr index.html for GitHub Pages.
 
 The browser never contacts Danbooru. This script runs in GitHub Actions,
 fetches a fresh safe snapshot server-side, embeds image bytes as data URLs,
@@ -14,12 +14,15 @@ import os
 import random
 import sys
 import time
+from io import BytesIO
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
+
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE_PATH = ROOT / "index.template.html"
@@ -38,10 +41,18 @@ TARGET_PER_POOL = int(os.getenv("TARGET_PER_POOL", "18"))
 FETCH_LIMIT = int(os.getenv("FETCH_LIMIT", "100"))
 MAX_PAGE = int(os.getenv("MAX_PAGE", "14"))
 MAX_API_ATTEMPTS = int(os.getenv("MAX_API_ATTEMPTS", "10"))
-MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", "500000"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "25"))
 MIN_UNIQUE_ARTISTS = 4
-VARIANT_PRIORITY = ("720x720", "360x360", "180x180")
+
+# Aspect-ratio-safe image pipeline. We never use Danbooru's square thumbnail
+# variants. Instead we download a full/aspect-preserving image and resize it
+# ourselves with Pillow using thumbnail(), which never crops.
+MAX_SOURCE_IMAGE_BYTES = int(os.getenv("MAX_SOURCE_IMAGE_BYTES", "25000000"))
+MAX_EMBED_IMAGE_BYTES = int(os.getenv("MAX_EMBED_IMAGE_BYTES", "750000"))
+MAX_IMAGE_DIM = int(os.getenv("MAX_IMAGE_DIM", "1200"))
+WEBP_QUALITY = int(os.getenv("WEBP_QUALITY", "84"))
+MIN_WEBP_QUALITY = int(os.getenv("MIN_WEBP_QUALITY", "56"))
+
 USER_AGENT = os.getenv(
     "ARTIST_GUESSR_USER_AGENT",
     "ArtistGuessr/1.3 (+https://github.com/; GitHub Actions snapshot builder)",
@@ -90,27 +101,28 @@ def single_artist(post: dict[str, Any]) -> str | None:
     return artists[0] if len(artists) == 1 else None
 
 
-def media_variants(post: dict[str, Any]) -> list[tuple[str, str]]:
-    media_asset = post.get("media_asset") or {}
-    variants = media_asset.get("variants") or []
-    by_type: dict[str, str] = {}
-    for variant in variants:
-        if not isinstance(variant, dict):
-            continue
-        vtype = str(variant.get("type") or "")
-        raw_url = variant.get("url")
-        if vtype and raw_url:
-            by_type[vtype] = urljoin(API_BASE + "/", str(raw_url))
+def image_sources(post: dict[str, Any]) -> list[tuple[str, str]]:
+    """Return only aspect-ratio-preserving Danbooru image sources.
 
+    Do not use media_asset 720x720 / 360x360 / 180x180 variants or
+    preview_file_url here: those may be square crops. The GitHub Action can
+    afford to download a larger source and resize it itself without cropping.
+    """
     result: list[tuple[str, str]] = []
-    for vtype in VARIANT_PRIORITY:
-        if vtype in by_type:
-            result.append((vtype, by_type[vtype]))
+    seen: set[str] = set()
 
-    for label, key in (("preview", "preview_file_url"), ("large", "large_file_url"), ("original", "file_url")):
+    # large_file_url is usually cheaper to download and preserves aspect ratio.
+    # file_url is the original fallback if a large version is unavailable.
+    for label, key in (("large", "large_file_url"), ("original", "file_url")):
         raw_url = post.get(key)
-        if raw_url:
-            result.append((label, urljoin(API_BASE + "/", str(raw_url))))
+        if not raw_url:
+            continue
+        url = urljoin(API_BASE + "/", str(raw_url))
+        if url in seen:
+            continue
+        seen.add(url)
+        result.append((label, url))
+
     return result
 
 
@@ -120,7 +132,7 @@ def normalize_post(post: dict[str, Any], pool_tag: str, pool_label: str) -> dict
         return None
     if post.get("rating") != "g" or post.get("is_deleted") is True:
         return None
-    candidates = media_variants(post)
+    candidates = image_sources(post)
     if not candidates:
         return None
     source = str(post.get("source") or "")
@@ -148,7 +160,7 @@ def fetch_pool(pool_tag: str, pool_label: str) -> list[dict[str, Any]]:
             "tags": f"{pool_tag} {RATING_TAG}",
             "limit": FETCH_LIMIT,
             "page": page,
-            "only": "id,tag_string_artist,rating,is_deleted,source,file_url,large_file_url,preview_file_url,media_asset",
+            "only": "id,tag_string_artist,rating,is_deleted,source,file_url,large_file_url",
         })
         url = f"{API_BASE}/posts.json?{params}"
         try:
@@ -199,6 +211,55 @@ def select_varied_posts(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return selected
 
 
+def _prepare_image(data: bytes) -> Image.Image:
+    """Decode one image frame and normalize orientation without cropping."""
+    with Image.open(BytesIO(data)) as source:
+        # Animated files are intentionally flattened to their first frame; the
+        # frame keeps the original canvas/aspect ratio.
+        try:
+            source.seek(0)
+        except EOFError:
+            pass
+        image = ImageOps.exif_transpose(source).copy()
+
+    # Keep transparency where it exists; otherwise use RGB for smaller WebP.
+    has_alpha = "A" in image.getbands() or "transparency" in image.info
+    return image.convert("RGBA" if has_alpha else "RGB")
+
+
+def _resize_to_long_edge(image: Image.Image, max_dim: int) -> Image.Image:
+    """Scale down to max_dim while preserving aspect ratio; never crop/upscale."""
+    resized = image.copy()
+    if resized.width > max_dim or resized.height > max_dim:
+        resized.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+    return resized
+
+
+def _encode_webp_with_budget(image: Image.Image) -> bytes:
+    """Encode as WebP under the target budget without changing aspect ratio."""
+    working = _resize_to_long_edge(image, MAX_IMAGE_DIM)
+
+    # First lower quality. If that is still too large, reduce both dimensions
+    # proportionally and try again. At no point do we crop or force a square.
+    while True:
+        for quality in range(WEBP_QUALITY, MIN_WEBP_QUALITY - 1, -7):
+            output = BytesIO()
+            working.save(output, format="WEBP", quality=quality, method=6)
+            payload = output.getvalue()
+            if len(payload) <= MAX_EMBED_IMAGE_BYTES:
+                return payload
+
+        longest = max(working.size)
+        if longest <= 420:
+            # Keep the best low-quality encode rather than crop the image.
+            return payload
+
+        next_longest = max(420, int(longest * 0.85))
+        new_width = max(1, round(working.width * next_longest / longest))
+        new_height = max(1, round(working.height * next_longest / longest))
+        working = working.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+
 def download_image(item: dict[str, Any]) -> tuple[str, str]:
     last: Exception | None = None
     for label, url in item["candidates"]:
@@ -208,18 +269,40 @@ def download_image(item: dict[str, Any]) -> tuple[str, str]:
                 url,
                 accept="image/avif,image/webp,image/*,*/*;q=0.8",
                 referer=API_BASE + "/",
-                max_bytes=MAX_IMAGE_BYTES,
+                max_bytes=MAX_SOURCE_IMAGE_BYTES,
             )
             if not content_type.startswith("image/"):
                 raise ValueError(f"not an image ({content_type})")
             if not data:
                 raise ValueError("empty image")
-            encoded = base64.b64encode(data).decode("ascii")
-            return f"data:{content_type};base64,{encoded}", f"{label}@{host}"
-        except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+
+            image = _prepare_image(data)
+            original_size = image.size
+            encoded_bytes = _encode_webp_with_budget(image)
+
+            # Re-open the result only for logging/verification of final geometry.
+            with Image.open(BytesIO(encoded_bytes)) as encoded_image:
+                final_size = encoded_image.size
+
+            # thumbnail/resize above are proportional; this tolerance only guards
+            # against an accidental future regression in the build pipeline.
+            source_ratio = original_size[0] / original_size[1]
+            final_ratio = final_size[0] / final_size[1]
+            if abs(source_ratio - final_ratio) > 0.01:
+                raise ValueError(
+                    f"aspect ratio changed unexpectedly: {original_size} -> {final_size}"
+                )
+
+            encoded = base64.b64encode(encoded_bytes).decode("ascii")
+            route = (
+                f"{label}@{host} {original_size[0]}x{original_size[1]}"
+                f"->{final_size[0]}x{final_size[1]} {len(encoded_bytes) // 1024}KiB"
+            )
+            return f"data:image/webp;base64,{encoded}", route
+        except (HTTPError, URLError, TimeoutError, ValueError, OSError, UnidentifiedImageError) as exc:
             last = exc
             log(f"    post {item['id']} {label}@{host} failed: {exc}")
-    raise RuntimeError(f"post {item['id']}: all image candidates failed: {last}")
+    raise RuntimeError(f"post {item['id']}: all aspect-safe image sources failed: {last}")
 
 
 def build_pool(pool_tag: str, pool_label: str) -> list[dict[str, Any]]:
