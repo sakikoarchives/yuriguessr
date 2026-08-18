@@ -35,7 +35,7 @@
       display: grid; place-items: center; width: 100%; height: min(62vh, 560px);
       min-height: 250px; overflow: hidden; border-radius: 8px; background: #08090b;
     }
-    .artwork-frame img { display: block; width: 100%; height: 100%; object-fit: contain; }
+    .artwork-frame img { display: block; width: 100%; height: 100%; object-fit: contain; object-position: center center; }
     .answers { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin-top: 8px; }
     .answer, .primary { border: 1px solid var(--line); border-radius: 7px; font-weight: 700; }
     .answer {
@@ -124,7 +124,7 @@
     const BUILD_META = __BUILD_META__;
 
     const CONFIG = {
-      build: "1.3.0-actions-snapshot",
+      build: "1.4.0-aspect-safe",
       choicesPerRound: 4,
       startScore: 100,
       correctBase: 100,
@@ -413,3 +413,4 @@
   </script>
 </body>
 </html>
+
