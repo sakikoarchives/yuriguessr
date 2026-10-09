@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
-"""Build a self-contained Yuri Guessr index.html for GitHub Pages.
+"""Build a static Yuri Guessr snapshot for GitHub Pages.
 
-The browser never contacts Danbooru. This script runs in GitHub Actions,
-fetches a fresh safe snapshot server-side, embeds image bytes as data URLs,
-and writes dist/index.html.
+Only the GitHub Action contacts Danbooru. Artwork is downloaded,
+resized without cropping, and saved as individual WebP assets.
+The HTML contains a small metadata manifest and loads only needed images.
 """
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 import random
-import sys
+import shutil
 import time
 from io import BytesIO
 from datetime import datetime, timezone
@@ -27,7 +26,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE_PATH = ROOT / "index.template.html"
 DIST_DIR = ROOT / "dist"
-OUTPUT_PATH = DIST_DIR / "index.html"
+STAGING_DIR = ROOT / "dist.building"
 
 API_BASE = "https://danbooru.donmai.us"
 RATING_TAG = "yuri"
@@ -37,25 +36,28 @@ POOLS = [
     ("honkai_(series)", "Honkai (series)"),
 ]
 
-TARGET_PER_POOL = int(os.getenv("TARGET_PER_POOL", "18"))
+TARGET_PER_POOL = int(os.getenv("TARGET_PER_POOL", "120"))
+# A sparse category should still update with the old baseline instead of
+# preventing the whole daily deployment when fewer than 120 artworks exist.
+MIN_PER_POOL = int(os.getenv("MIN_PER_POOL", "18"))
 FETCH_LIMIT = int(os.getenv("FETCH_LIMIT", "100"))
-MAX_PAGE = int(os.getenv("MAX_PAGE", "14"))
-MAX_API_ATTEMPTS = int(os.getenv("MAX_API_ATTEMPTS", "10"))
+MAX_PAGE = int(os.getenv("MAX_PAGE", "60"))
+MAX_API_ATTEMPTS = int(os.getenv("MAX_API_ATTEMPTS", "45"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "25"))
 MIN_UNIQUE_ARTISTS = 4
 
-# Aspect-ratio-safe image pipeline. We never use Danbooru's square thumbnail
-# variants. Instead we download a full/aspect-preserving image and resize it
-# ourselves with Pillow using thumbnail(), which never crops.
+# Never request square thumbnail variants. Validate candidates against Danbooru's
+# original image dimensions, then resize proportionally without cropping.
 MAX_SOURCE_IMAGE_BYTES = int(os.getenv("MAX_SOURCE_IMAGE_BYTES", "25000000"))
-MAX_EMBED_IMAGE_BYTES = int(os.getenv("MAX_EMBED_IMAGE_BYTES", "750000"))
+# MAX_EMBED_IMAGE_BYTES remains supported for existing workflow overrides.
+MAX_EMBED_IMAGE_BYTES = int(os.getenv("MAX_OUTPUT_IMAGE_BYTES", os.getenv("MAX_EMBED_IMAGE_BYTES", "750000")))
 MAX_IMAGE_DIM = int(os.getenv("MAX_IMAGE_DIM", "1200"))
 WEBP_QUALITY = int(os.getenv("WEBP_QUALITY", "84"))
 MIN_WEBP_QUALITY = int(os.getenv("MIN_WEBP_QUALITY", "56"))
 
 USER_AGENT = os.getenv(
     "ARTIST_GUESSR_USER_AGENT",
-    "ArtistGuessr/1.3 (+https://github.com/; GitHub Actions snapshot builder)",
+    "ArtistGuessr/1.5 (+https://github.com/; GitHub Actions snapshot builder)",
 )
 
 
@@ -146,13 +148,17 @@ def normalize_post(post: dict[str, Any], pool_tag: str, pool_label: str) -> dict
         "postUrl": f"{API_BASE}/posts/{post['id']}",
         "sourceUrl": source,
         "candidates": candidates,
+        "imageWidth": int(post.get("image_width") or 0),
+        "imageHeight": int(post.get("image_height") or 0),
     }
 
 
 def fetch_pool(pool_tag: str, pool_label: str) -> list[dict[str, Any]]:
     log(f"Fetching metadata: {pool_label}")
-    pages = list(range(1, MAX_PAGE + 1))
+    # Always inspect the newest page; random older pages vary the daily snapshot.
+    pages = list(range(2, MAX_PAGE + 1))
     random.shuffle(pages)
+    pages.insert(0, 1)
     by_id: dict[int, dict[str, Any]] = {}
 
     for page in pages[:MAX_API_ATTEMPTS]:
@@ -160,7 +166,7 @@ def fetch_pool(pool_tag: str, pool_label: str) -> list[dict[str, Any]]:
             "tags": f"{pool_tag} {RATING_TAG}",
             "limit": FETCH_LIMIT,
             "page": page,
-            "only": "id,tag_string_artist,rating,is_deleted,source,file_url,large_file_url",
+            "only": "id,tag_string_artist,rating,is_deleted,source,file_url,large_file_url,image_width,image_height",
         })
         url = f"{API_BASE}/posts.json?{params}"
         try:
@@ -183,13 +189,13 @@ def fetch_pool(pool_tag: str, pool_label: str) -> list[dict[str, Any]]:
         log(f"  page {page}: {usable} usable; total {len(by_id)} posts / {len(artists)} artists")
         if len(by_id) >= TARGET_PER_POOL * 2 and len(artists) >= max(MIN_UNIQUE_ARTISTS, TARGET_PER_POOL // 2):
             break
-        time.sleep(0.35)
+        time.sleep(0.8)
 
     artists = {item["artist"] for item in by_id.values()}
     if len(artists) < MIN_UNIQUE_ARTISTS:
         raise RuntimeError(f"{pool_label}: only {len(artists)} unique artists were found")
-    if len(by_id) < TARGET_PER_POOL:
-        raise RuntimeError(f"{pool_label}: only {len(by_id)} usable posts were found; need {TARGET_PER_POOL}")
+    if len(by_id) < MIN_PER_POOL:
+        raise RuntimeError(f"{pool_label}: only {len(by_id)} usable posts were found; need at least {MIN_PER_POOL}")
     return list(by_id.values())
 
 
@@ -250,17 +256,17 @@ def _encode_webp_with_budget(image: Image.Image) -> bytes:
                 return payload
 
         longest = max(working.size)
-        if longest <= 420:
-            # Keep the best low-quality encode rather than crop the image.
-            return payload
+        if longest <= 96:
+            # Preserve the byte budget even for complex or noisy images.
+            raise ValueError(f"WebP exceeds {MAX_EMBED_IMAGE_BYTES} bytes at minimum dimension")
 
-        next_longest = max(420, int(longest * 0.85))
+        next_longest = max(96, int(longest * 0.85))
         new_width = max(1, round(working.width * next_longest / longest))
         new_height = max(1, round(working.height * next_longest / longest))
         working = working.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
 
-def download_image(item: dict[str, Any]) -> tuple[str, str]:
+def download_image(item: dict[str, Any]) -> tuple[bytes, str]:
     last: Exception | None = None
     for label, url in item["candidates"]:
         host = urlparse(url).hostname or "unknown"
@@ -278,35 +284,51 @@ def download_image(item: dict[str, Any]) -> tuple[str, str]:
 
             image = _prepare_image(data)
             original_size = image.size
+            expected_width = item.get("imageWidth") or 0
+            expected_height = item.get("imageHeight") or 0
+            if expected_width > 0 and expected_height > 0:
+                # A source URL can unexpectedly point at a cropped rendition.
+                # Refuse it and try the original file instead.
+                expected_ratio = expected_width / expected_height
+                actual_ratio = image.width / image.height
+                if abs(expected_ratio - actual_ratio) > 0.015 * expected_ratio:
+                    raise ValueError(
+                        f"source does not match original aspect ratio: "
+                        f"{original_size} vs {expected_width}x{expected_height}"
+                    )
             encoded_bytes = _encode_webp_with_budget(image)
 
             # Re-open the result only for logging/verification of final geometry.
             with Image.open(BytesIO(encoded_bytes)) as encoded_image:
                 final_size = encoded_image.size
 
-            # thumbnail/resize above are proportional; this tolerance only guards
-            # against an accidental future regression in the build pipeline.
-            source_ratio = original_size[0] / original_size[1]
-            final_ratio = final_size[0] / final_size[1]
-            if abs(source_ratio - final_ratio) > 0.01:
+            # Compare the shorter edge after proportional scaling. Allow a
+            # single rounding pixel: absolute ratio comparisons incorrectly
+            # reject very wide panoramas after downsizing to integer pixels.
+            expected_short = min(original_size) * max(final_size) / max(original_size)
+            if abs(min(final_size) - expected_short) > 1.1:
                 raise ValueError(
                     f"aspect ratio changed unexpectedly: {original_size} -> {final_size}"
                 )
 
-            encoded = base64.b64encode(encoded_bytes).decode("ascii")
             route = (
                 f"{label}@{host} {original_size[0]}x{original_size[1]}"
                 f"->{final_size[0]}x{final_size[1]} {len(encoded_bytes) // 1024}KiB"
             )
-            return f"data:image/webp;base64,{encoded}", route
+            return encoded_bytes, route
         except (HTTPError, URLError, TimeoutError, ValueError, OSError, UnidentifiedImageError) as exc:
             last = exc
             log(f"    post {item['id']} {label}@{host} failed: {exc}")
     raise RuntimeError(f"post {item['id']}: all aspect-safe image sources failed: {last}")
 
 
-def build_pool(pool_tag: str, pool_label: str) -> list[dict[str, Any]]:
-    metadata = fetch_pool(pool_tag, pool_label)
+def build_pool(
+    pool_tag: str, pool_label: str, image_dir: Path, excluded_ids: set[int],
+) -> list[dict[str, Any]]:
+    # A single post can have tags from several games. Never publish it twice.
+    metadata = [item for item in fetch_pool(pool_tag, pool_label) if item["id"] not in excluded_ids]
+    if len(metadata) < MIN_PER_POOL:
+        raise RuntimeError(f"{pool_label}: only {len(metadata)} distinct posts remain after cross-pool deduplication")
     candidates = select_varied_posts(metadata)
     result: list[dict[str, Any]] = []
     failures = 0
@@ -321,11 +343,12 @@ def build_pool(pool_tag: str, pool_label: str) -> list[dict[str, Any]]:
         if len(result) >= TARGET_PER_POOL:
             break
         try:
-            image_data, route = download_image(item)
+            image_bytes, route = download_image(item)
         except RuntimeError as exc:
             failures += 1
             log(f"  image skip: {exc}")
             continue
+        image_dir.joinpath(f"{item['id']}.webp").write_bytes(image_bytes)
         result.append({
             "id": item["id"],
             "artist": item["artist"],
@@ -333,26 +356,27 @@ def build_pool(pool_tag: str, pool_label: str) -> list[dict[str, Any]]:
             "poolLabel": item["poolLabel"],
             "postUrl": item["postUrl"],
             "sourceUrl": item["sourceUrl"],
-            "imageData": image_data,
+            "imageData": f"images/{item['id']}.webp",
         })
-        log(f"  embedded {len(result):02d}/{TARGET_PER_POOL}: post {item['id']} ({route}, {item['artist']})")
-        time.sleep(0.18)
+        log(f"  saved {len(result):03d}/{TARGET_PER_POOL}: post {item['id']} ({route}, {item['artist']})")
+        time.sleep(0.9)
 
     artists = {item["artist"] for item in result}
-    if len(result) < TARGET_PER_POOL:
-        raise RuntimeError(f"{pool_label}: embedded only {len(result)}/{TARGET_PER_POOL} artworks ({failures} failures)")
+    if len(result) < MIN_PER_POOL:
+        raise RuntimeError(f"{pool_label}: saved only {len(result)}/{TARGET_PER_POOL} artworks ({failures} failures)")
     if len(artists) < MIN_UNIQUE_ARTISTS:
         raise RuntimeError(f"{pool_label}: snapshot has only {len(artists)} unique artists")
     return result
 
 
-def render_html(game_data: list[dict[str, Any]]) -> None:
+def render_html(game_data: list[dict[str, Any]], output_dir: Path) -> None:
     template = TEMPLATE_PATH.read_text(encoding="utf-8")
     built_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     metadata = {
         "builtAt": built_at,
         "artworkCount": len(game_data),
         "targetPerPool": TARGET_PER_POOL,
+    "minPerPool": MIN_PER_POOL,
         "pools": [label for _, label in POOLS],
     }
     compact_data = json.dumps(game_data, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
@@ -360,20 +384,38 @@ def render_html(game_data: list[dict[str, Any]]) -> None:
     output = template.replace("__GAME_DATA__", compact_data).replace("__BUILD_META__", compact_meta)
     if "__GAME_DATA__" in output or "__BUILD_META__" in output:
         raise RuntimeError("template placeholders were not replaced")
-    DIST_DIR.mkdir(parents=True, exist_ok=True)
-    OUTPUT_PATH.write_text(output, encoding="utf-8")
-    size_mb = OUTPUT_PATH.stat().st_size / (1024 * 1024)
-    log(f"Built {OUTPUT_PATH} ({len(game_data)} artworks, {size_mb:.2f} MiB)")
+    output_path = output_dir / "index.html"
+    output_path.write_text(output, encoding="utf-8")
+    size_mb = output_path.stat().st_size / (1024 * 1024)
+    log(f"Built {output_path} ({len(game_data)} artworks, HTML {size_mb:.2f} MiB)")
 
 
 def main() -> int:
     random.seed(os.getenv("GITHUB_RUN_ID") or str(time.time_ns()))
+    # Only replace the published snapshot after a complete successful build.
+    # A transient Danbooru error must not leave a half-built local dist tree.
+    if STAGING_DIR.exists():
+        shutil.rmtree(STAGING_DIR)
+    image_dir = STAGING_DIR / "images"
+    image_dir.mkdir(parents=True)
     all_items: list[dict[str, Any]] = []
-    for pool_tag, pool_label in POOLS:
-        all_items.extend(build_pool(pool_tag, pool_label))
-    random.shuffle(all_items)
-    render_html(all_items)
-    return 0
+    used_ids: set[int] = set()
+    try:
+        for pool_tag, pool_label in POOLS:
+            items = build_pool(pool_tag, pool_label, image_dir, used_ids)
+            used_ids.update(item["id"] for item in items)
+            all_items.extend(items)
+        random.shuffle(all_items)
+        render_html(all_items, STAGING_DIR)
+        snapshot_bytes = sum(file.stat().st_size for file in image_dir.iterdir())
+        log(f"Snapshot: {len(all_items)} unique posts; images {snapshot_bytes / 1024**2:.1f} MiB")
+        if DIST_DIR.exists():
+            shutil.rmtree(DIST_DIR)
+        STAGING_DIR.rename(DIST_DIR)
+        return 0
+    finally:
+        if STAGING_DIR.exists():
+            shutil.rmtree(STAGING_DIR)
 
 
 if __name__ == "__main__":

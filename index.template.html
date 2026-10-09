@@ -32,10 +32,16 @@
     .hud span:nth-child(2) { color: #f5f5f7; font-size: .92rem; }
     .hud span:last-child { text-align: right; }
     .artwork-frame {
-      display: grid; place-items: center; width: 100%; height: min(62vh, 560px);
-      min-height: 250px; overflow: hidden; border-radius: 8px; background: #08090b;
+      display: grid; place-items: center; width: 100%;
+      border-radius: 8px; background: #08090b;
     }
-    .artwork-frame img { display: block; width: 100%; height: 100%; object-fit: contain; object-position: center center; }
+    /* Intrinsic dimensions, rather than a fixed-height clipped viewport. */
+    .artwork-frame img {
+      display: block; width: auto; height: auto; max-width: 100%;
+      max-height: min(82vh, 900px); max-height: min(82svh, 900px);
+      object-fit: contain; object-position: center;
+      border-radius: 8px;
+    }
     .answers { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin-top: 8px; }
     .answer, .primary { border: 1px solid var(--line); border-radius: 7px; font-weight: 700; }
     .answer {
@@ -75,7 +81,7 @@
     @keyframes spin { to { transform: rotate(360deg); } }
     @media (max-width: 560px) {
       .game { padding: 7px; }
-      .artwork-frame { height: 55vh; min-height: 220px; }
+      .artwork-frame img { max-height: min(75vh, 800px); max-height: min(75svh, 800px); }
       .answers { grid-template-columns: 1fr; }
       .answer { min-height: 43px; }
       .feedback { align-items: flex-start; }
@@ -102,7 +108,7 @@
     </section>
 
     <section id="playPanel" class="hidden">
-      <div class="artwork-frame"><img id="artwork" alt="Artwork for the current round" /></div>
+      <div class="artwork-frame"><img id="artwork" alt="Artwork for the current round" decoding="async" /></div>
       <div id="answers" class="answers" aria-label="Artist choices"></div>
       <div id="feedback" class="feedback hidden" aria-live="polite">
         <div class="feedback-copy"><strong id="feedbackTitle"></strong><span id="feedbackArtist"></span></div>
@@ -111,7 +117,7 @@
     </section>
 
     <section id="finishPanel" class="state-panel hidden">
-      <p class="game-over">Game over</p>
+      <p id="finishTitle" class="game-over">Game over</p>
       <p id="finalStats" class="final-stats"></p>
       <button class="primary" id="restartButton" type="button">Play again</button>
     </section>
@@ -124,7 +130,7 @@
     const BUILD_META = __BUILD_META__;
 
     const CONFIG = {
-      build: "1.4.0-aspect-safe",
+      build: "1.5.0-unique-artwork",
       choicesPerRound: 4,
       startScore: 100,
       correctBase: 100,
@@ -136,11 +142,19 @@
       gameOverDelay: 1600,
     };
 
+    const SEEN_STORAGE_KEY = "yuriguessr-seen-artworks-v1";
+
+    class NoMoreArtworksError extends Error {
+      constructor() { super("All artworks in this snapshot have been seen."); }
+    }
+
     const state = {
-      pool: [], availablePools: [], poolBag: [], usedIdsByPool: new Map(),
+      pool: [], poolByTag: new Map(), availablePools: [], poolBag: [],
+      // A globally unique history also protects against cross-tagged posts.
+      seenIds: new Set(), reservedIds: new Set(), failedIds: new Set(),
       currentRound: null, nextRound: null, nextRoundPromise: null,
       roundNumber: 0, score: CONFIG.startScore, streak: 0, bestStreak: 0,
-      locked: true, advanceTimer: null, sessionId: 0,
+      locked: true, advanceTimer: null, sessionId: 0, replayOnRestart: false,
     };
 
     const el = {
@@ -152,7 +166,7 @@
       feedback: document.querySelector("#feedback"), feedbackTitle: document.querySelector("#feedbackTitle"),
       feedbackArtist: document.querySelector("#feedbackArtist"), postLink: document.querySelector("#postLink"),
       retryButton: document.querySelector("#retryButton"), restartButton: document.querySelector("#restartButton"),
-      finalStats: document.querySelector("#finalStats"),
+      finalStats: document.querySelector("#finalStats"), finishTitle: document.querySelector("#finishTitle"),
     };
 
     function shuffle(items) {
@@ -166,6 +180,33 @@
 
     function displayTag(tag) { return String(tag).replaceAll("_", " "); }
     function errorMessage(error) { return error instanceof Error ? error.message : String(error); }
+
+    // Store post IDs, not artwork bytes. Read/write failures (private browsing or
+    // storage quotas) never prevent playing; the in-memory set still works.
+    function loadSeenHistory() {
+      try {
+        const saved = JSON.parse(localStorage.getItem(SEEN_STORAGE_KEY) || "[]");
+        if (!Array.isArray(saved)) return new Set();
+        return new Set(saved.filter((id) => Number.isSafeInteger(id) && id > 0));
+      } catch (error) {
+        console.warn("Could not read artwork history", error);
+        return new Set();
+      }
+    }
+
+    function saveSeenHistory() {
+      try {
+        // Merge another open tab's recent progress before saving.
+        for (const id of loadSeenHistory()) state.seenIds.add(id);
+        localStorage.setItem(SEEN_STORAGE_KEY, JSON.stringify([...state.seenIds]));
+      } catch (error) { console.warn("Could not save artwork history", error); }
+    }
+
+    function forgetSeenHistory() {
+      state.seenIds.clear();
+      try { localStorage.removeItem(SEEN_STORAGE_KEY); }
+      catch (error) { console.warn("Could not reset artwork history", error); }
+    }
 
     function setVisible(panel) {
       [el.loadingPanel, el.errorPanel, el.playPanel, el.finishPanel].forEach((node) => {
@@ -182,8 +223,11 @@
     function validateData() {
       if (!Array.isArray(GAME_DATA) || GAME_DATA.length === 0) throw new Error("No built-in game data was found.");
       const grouped = new Map();
+      const uniqueIds = new Set();
       for (const item of GAME_DATA) {
-        if (!item?.id || !item?.artist || !item?.imageData || !item?.poolTag) continue;
+        if (!Number.isSafeInteger(item?.id) || !item.artist || !item.imageData || !item.poolTag) continue;
+        if (uniqueIds.has(item.id)) continue;
+        uniqueIds.add(item.id);
         if (!grouped.has(item.poolTag)) grouped.set(item.poolTag, []);
         grouped.get(item.poolTag).push(item);
       }
@@ -194,14 +238,26 @@
           throw new Error(`${poolTag} contains only ${artists.size} unique artists; ${CONFIG.choicesPerRound} are required.`);
         }
       }
+      state.poolByTag = grouped;
       return [...grouped.keys()];
     }
 
-    function refillPoolBag() { state.poolBag = shuffle([...state.availablePools]); }
-    function takeNextPoolTag() { if (!state.poolBag.length) refillPoolBag(); return state.poolBag.pop(); }
-    function getUsedIds(poolTag) {
-      if (!state.usedIdsByPool.has(poolTag)) state.usedIdsByPool.set(poolTag, new Set());
-      return state.usedIdsByPool.get(poolTag);
+    function isUnused(post) {
+      return !state.seenIds.has(post.id) && !state.reservedIds.has(post.id) && !state.failedIds.has(post.id);
+    }
+
+    function remainingPosts(poolTag) { return (state.poolByTag.get(poolTag) || []).filter(isUnused); }
+
+    function takeNextPoolTag() {
+      const eligible = state.availablePools.filter((tag) => remainingPosts(tag).length);
+      if (!eligible.length) return null;
+      // Skip empty pools without prematurely refilling or repeating any post.
+      while (state.poolBag.length) {
+        const tag = state.poolBag.pop();
+        if (eligible.includes(tag)) return tag;
+      }
+      state.poolBag = shuffle(eligible);
+      return state.poolBag.pop();
     }
 
     function makeRound(post, postsInPool) {
@@ -211,24 +267,22 @@
       return { ...post, choices: shuffle([post.artist, ...distractors]) };
     }
 
-    function buildRoundForPool(poolTag) {
-      const postsInPool = state.pool.filter((post) => post.poolTag === poolTag);
-      const usedIds = getUsedIds(poolTag);
-      let candidates = postsInPool.filter((post) => !usedIds.has(post.id));
-      if (!candidates.length) { usedIds.clear(); candidates = [...postsInPool]; }
+    function buildNextRound() {
+      const poolTag = takeNextPoolTag();
+      if (!poolTag) return null;
+      const postsInPool = state.poolByTag.get(poolTag);
+      let candidates = remainingPosts(poolTag);
       const currentArtist = state.currentRound?.artist;
       const noImmediateRepeat = candidates.filter((post) => post.artist !== currentArtist);
       if (noImmediateRepeat.length) candidates = noImmediateRepeat;
       for (const post of shuffle(candidates)) {
         const round = makeRound(post, postsInPool);
         if (!round) continue;
-        usedIds.add(post.id);
+        state.reservedIds.add(post.id); // A preloaded round cannot be selected again.
         return round;
       }
       throw new Error(`Could not build a round from ${poolTag}.`);
     }
-
-    function buildNextRound() { return buildRoundForPool(takeNextPoolTag()); }
 
     function preloadRound(round) {
       return new Promise((resolve, reject) => {
@@ -240,18 +294,33 @@
       });
     }
 
-    async function createPreloadedRound() {
+    async function createPreloadedRound(sessionId) {
       let lastError = null;
-      for (let attempt = 0; attempt < Math.max(8, state.availablePools.length * 3); attempt += 1) {
+      // Exhaust all remaining candidates rather than retrying an already seen ID.
+      while (state.sessionId === sessionId) {
         const round = buildNextRound();
-        try { return await preloadRound(round); }
-        catch (error) { lastError = error; }
+        if (!round) {
+          if (lastError) throw lastError;
+          throw new NoMoreArtworksError();
+        }
+        const reservations = state.reservedIds;
+        const failures = state.failedIds;
+        try {
+          await preloadRound(round);
+          if (state.sessionId !== sessionId) return null;
+          return round;
+        } catch (error) {
+          reservations.delete(round.id);
+          if (state.sessionId !== sessionId) return null;
+          failures.add(round.id);
+          lastError = error;
+        }
       }
-      throw lastError || new Error("Could not preload a round.");
+      return null;
     }
 
     function prepareNextRound(sessionId) {
-      const promise = createPreloadedRound().then((round) => {
+      const promise = createPreloadedRound(sessionId).then((round) => {
         if (state.sessionId === sessionId) state.nextRound = round;
         return round;
       }).finally(() => {
@@ -270,6 +339,10 @@
     function renderRound() {
       const round = state.currentRound;
       if (!round) return;
+      // Mark an artwork as seen when it is actually displayed, not when queued.
+      state.reservedIds.delete(round.id);
+      state.seenIds.add(round.id);
+      saveSeenHistory();
       state.locked = false;
       updateStats();
       el.answers.replaceChildren();
@@ -296,7 +369,9 @@
       });
 
       if (!state.nextRound && !state.nextRoundPromise) {
-        prepareNextRound(state.sessionId).catch((error) => console.warn(error));
+        prepareNextRound(state.sessionId).catch((error) => {
+          if (!(error instanceof NoMoreArtworksError)) console.warn(error);
+        });
       }
     }
 
@@ -337,21 +412,33 @@
 
     async function advanceRound() {
       if (!state.locked) return;
+      const sessionId = state.sessionId;
       try {
         let next = state.nextRound;
         if (!next && state.nextRoundPromise) next = await state.nextRoundPromise;
-        if (!next) next = await createPreloadedRound();
+        if (!next) next = await createPreloadedRound(sessionId);
+        if (state.sessionId !== sessionId) return;
+        if (!next) return;
         state.nextRound = null;
         state.currentRound = next;
         state.roundNumber += 1;
         renderRound();
-      } catch (error) { showError(error); }
+      } catch (error) {
+        if (state.sessionId !== sessionId) return;
+        if (error instanceof NoMoreArtworksError) finishGame(true);
+        else showError(error);
+      }
     }
 
-    function finishGame() {
+    function finishGame(exhausted = false) {
       clearTimeout(state.advanceTimer);
       state.locked = true;
-      el.finalStats.textContent = `Rounds survived: ${state.roundNumber} · Best streak: ${state.bestStreak}`;
+      state.replayOnRestart = exhausted;
+      el.finishTitle.textContent = exhausted ? "All artworks seen!" : "Game over";
+      el.finalStats.textContent = exhausted
+        ? `You've seen every available artwork in this snapshot (${state.pool.length}). Check back after the next update for a refreshed selection. · Best streak: ${state.bestStreak}`
+        : `Rounds survived: ${state.roundNumber} · Best streak: ${state.bestStreak}`;
+      el.restartButton.textContent = exhausted ? "Replay this collection" : "Play again";
       setVisible(el.finishPanel);
     }
 
@@ -374,7 +461,11 @@
       const sessionId = state.sessionId;
       state.pool = Array.isArray(GAME_DATA) ? GAME_DATA : [];
       state.poolBag = [];
-      state.usedIdsByPool = new Map();
+      state.poolByTag = new Map();
+      state.seenIds = new Set([...state.seenIds, ...loadSeenHistory()]);
+      state.reservedIds = new Set();
+      state.failedIds = new Set();
+      state.replayOnRestart = false;
       state.currentRound = null;
       state.nextRound = null;
       state.nextRoundPromise = null;
@@ -389,12 +480,16 @@
       setVisible(el.loadingPanel);
       try {
         state.availablePools = validateData();
-        state.currentRound = await createPreloadedRound();
+        state.currentRound = await createPreloadedRound(sessionId);
         if (state.sessionId !== sessionId) return;
         state.roundNumber = 1;
         setVisible(el.playPanel);
         renderRound();
-      } catch (error) { if (state.sessionId === sessionId) showError(error); }
+      } catch (error) {
+        if (state.sessionId !== sessionId) return;
+        if (error instanceof NoMoreArtworksError) finishGame(true);
+        else showError(error);
+      }
     }
 
     function handleKeyboard(event) {
@@ -406,7 +501,10 @@
     }
 
     el.retryButton.addEventListener("click", startGame);
-    el.restartButton.addEventListener("click", startGame);
+    el.restartButton.addEventListener("click", () => {
+      if (state.replayOnRestart) forgetSeenHistory();
+      startGame();
+    });
     document.addEventListener("keydown", handleKeyboard);
     window.__ARTIST_GUESSR_BUILD__ = CONFIG.build;
     startGame();
